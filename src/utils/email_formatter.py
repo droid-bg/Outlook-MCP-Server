@@ -1,8 +1,32 @@
 """Simple email formatting for AI-readable responses."""
 
 from typing import List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
+
+
+def _sort_key_time(email: Dict[str, Any], reverse: bool = False) -> datetime:
+    """Return a naive UTC datetime suitable for sorting.
+
+    Handles the mix of offset-aware and offset-naive datetimes that
+    Outlook COM can return.  Falls back to epoch-zero so emails
+    without a timestamp sort to the end.
+    """
+    dt = email.get('received_time')
+    if dt is None:
+        return datetime.min if not reverse else datetime.max
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _normalize_dt(dt: datetime) -> datetime:
+    """Strip timezone to make any datetime naive-UTC for comparison."""
+    if dt is None:
+        return datetime.min
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 from ..config.config_reader import config
 
@@ -62,7 +86,7 @@ def format_email_chain(emails: List[Dict[str, Any]], search_subject: str) -> Dic
     formatted_conversations = []
     for conv_id, conv_emails in conversations.items():
         # Sort emails in conversation by time
-        conv_emails.sort(key=lambda x: x.get('received_time', datetime.min))
+        conv_emails.sort(key=lambda x: _sort_key_time(x))
         
         formatted_conv = {
             "conversation_id": conv_id,
@@ -84,7 +108,7 @@ def format_email_chain(emails: List[Dict[str, Any]], search_subject: str) -> Dic
         "search_subject": search_subject,
         "summary": stats,
         "conversations": formatted_conversations,
-        "all_emails_chronological": [format_single_email(email) for email in sorted(emails, key=lambda x: x.get('received_time', datetime.min), reverse=True)]
+        "all_emails_chronological": [format_single_email(email) for email in sorted(emails, key=lambda x: _sort_key_time(x, reverse=True), reverse=True)]
     }
 
 
@@ -124,7 +148,7 @@ def format_alert_analysis(alerts: List[Dict[str, Any]], search_pattern: str) -> 
     alert_frequency = calculate_daily_frequency(alerts)
     
     # Get recent alerts (last 10)
-    recent_alerts = sorted(alerts, key=lambda x: x.get('received_time', datetime.min), reverse=True)[:10]
+    recent_alerts = sorted(alerts, key=lambda x: _sort_key_time(x, reverse=True), reverse=True)[:10]
     
     # Summary statistics
     stats = {
@@ -150,11 +174,13 @@ def format_alert_analysis(alerts: List[Dict[str, Any]], search_pattern: str) -> 
 
 def format_single_email(email: Dict[str, Any]) -> Dict[str, Any]:
     """Format a single email for AI consumption."""
-    
+
     formatted = {
         "subject": email.get('subject', 'No Subject'),
         "sender_name": email.get('sender_name', 'Unknown'),
         "sender_email": email.get('sender_email', ''),
+        "to": email.get('to_recipients', []),
+        "cc": email.get('cc_recipients', []),
         "recipients": email.get('recipients', []),
         "folder": email.get('folder_name', 'Unknown'),
         "mailbox": email.get('mailbox_type', 'unknown'),
@@ -164,12 +190,12 @@ def format_single_email(email: Dict[str, Any]) -> Dict[str, Any]:
         "unread": email.get('unread', False),
         "size_kb": round(email.get('size', 0) / 1024, 1)
     }
-    
+
     # Add timestamp if configured
     if config.get_bool('include_timestamps', True):
         received_time = email.get('received_time')
         formatted["received_time"] = received_time.isoformat() if received_time else None
-    
+
     return formatted
 
 
@@ -202,10 +228,11 @@ def get_date_range(emails: List[Dict[str, Any]]) -> Dict[str, str]:
     dates = [email.get('received_time') for email in emails if email.get('received_time')]
     if not dates:
         return {"first": None, "last": None}
-    
+
+    normalized = [_normalize_dt(d) for d in dates]
     return {
-        "first": min(dates).isoformat(),
-        "last": max(dates).isoformat()
+        "first": min(normalized).isoformat(),
+        "last": max(normalized).isoformat()
     }
 
 
@@ -224,32 +251,60 @@ def get_mailbox_distribution(emails: List[Dict[str, Any]]) -> Dict[str, int]:
 
 
 def get_participants(emails: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Get list of email participants with counts."""
-    participant_counts = defaultdict(int)
-    participant_emails = {}
-    
+    """Get list of email participants with counts and role breakdown.
+
+    Tracks how many times each person appeared as sender, To, or CC
+    so you can see who is central to a thread.
+    """
+    # keyed by lowercase email (or name if no email)
+    stats = {}  # key -> {name, email, sent, to, cc}
+
+    def _touch(key: str, name: str, email: str, role: str):
+        if key not in stats:
+            stats[key] = {'name': name, 'email': email, 'sent': 0, 'to': 0, 'cc': 0}
+        stats[key][role] += 1
+        # prefer the richer value
+        if email and not stats[key]['email']:
+            stats[key]['email'] = email
+        if name and (not stats[key]['name'] or stats[key]['name'] == 'Unknown'):
+            stats[key]['name'] = name
+
     for email in emails:
-        sender = email.get('sender_name', 'Unknown')
+        sender_name = email.get('sender_name', 'Unknown')
         sender_email = email.get('sender_email', '')
-        
-        participant_counts[sender] += 1
-        if sender_email:
-            participant_emails[sender] = sender_email
-        
-        # Count recipients
-        for recipient in email.get('recipients', []):
-            participant_counts[recipient] += 1
-    
-    # Sort by participation count
+        key = (sender_email or sender_name).lower()
+        _touch(key, sender_name, sender_email, 'sent')
+
+        for entry in email.get('to_recipients', []):
+            e = entry.get('email', '') if isinstance(entry, dict) else ''
+            n = entry.get('name', '') if isinstance(entry, dict) else str(entry)
+            k = (e or n).lower()
+            if k:
+                _touch(k, n, e, 'to')
+
+        for entry in email.get('cc_recipients', []):
+            e = entry.get('email', '') if isinstance(entry, dict) else ''
+            n = entry.get('name', '') if isinstance(entry, dict) else str(entry)
+            k = (e or n).lower()
+            if k:
+                _touch(k, n, e, 'cc')
+
+    # Sort by total participation
     participants = []
-    for name, count in sorted(participant_counts.items(), key=lambda x: x[1], reverse=True):
+    for info in sorted(stats.values(),
+                       key=lambda x: x['sent'] + x['to'] + x['cc'],
+                       reverse=True):
+        total = info['sent'] + info['to'] + info['cc']
         participants.append({
-            "name": name,
-            "email": participant_emails.get(name, ''),
-            "participation_count": count
+            "name": info['name'],
+            "email": info['email'],
+            "participation_count": total,
+            "sent": info['sent'],
+            "to_count": info['to'],
+            "cc_count": info['cc'],
         })
-    
-    return participants[:10]  # Top 10 participants
+
+    return participants[:20]  # Top 20 participants
 
 
 def calculate_daily_frequency(alerts: List[Dict[str, Any]]) -> float:
@@ -282,7 +337,7 @@ def create_alert_timeline(alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     timeline = []
     
     # Sort alerts by time
-    sorted_alerts = sorted(alerts, key=lambda x: x.get('received_time', datetime.min))
+    sorted_alerts = sorted(alerts, key=lambda x: _sort_key_time(x))
     
     for alert in sorted_alerts:
         timeline_entry = {
@@ -343,8 +398,9 @@ def get_importance_text(importance: int) -> str:
 
 
 def parse_iso_time(iso_string: str) -> datetime:
-    """Parse ISO timestamp string to datetime."""
+    """Parse ISO timestamp string to a naive-UTC datetime for sorting."""
     try:
-        return datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
+        return _normalize_dt(dt)
     except (ValueError, AttributeError):
         return datetime.min

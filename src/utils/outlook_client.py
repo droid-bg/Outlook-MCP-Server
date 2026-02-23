@@ -248,7 +248,16 @@ class OutlookClient:
                 self._shared_recipient_cache = None
 
         # Sort by received time (newest first)
-        all_emails.sort(key=lambda x: x.get('received_time', datetime.min), reverse=True)
+        def _sort_time(email):
+            dt = email.get('received_time')
+            if dt is None:
+                return datetime.max
+            if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+                from datetime import timezone
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+
+        all_emails.sort(key=_sort_time, reverse=True)
         
         # Cache results with timestamp
         limited_results = all_emails[:max_results]
