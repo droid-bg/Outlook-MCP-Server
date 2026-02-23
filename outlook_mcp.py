@@ -1,9 +1,11 @@
 """Simplified Outlook MCP Server with three main tools."""
 
 import asyncio
+import atexit
 import logging
 import platform
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
 # Check if running on Windows
@@ -16,6 +18,7 @@ if platform.system() != 'Windows':
     print("   3. Or access a remote Windows desktop")
     sys.exit(1)
 
+import pythoncom
 from mcp import server, types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -34,6 +37,48 @@ except ImportError as e:
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Dedicated COM thread
+#
+# Outlook COM objects live in an STA (Single-Threaded Apartment) and MUST be
+# accessed from the same thread that created them.  asyncio.to_thread() uses
+# a general thread pool where successive calls can land on different threads,
+# causing "RPC server is unavailable" errors.
+#
+# We create a single-worker ThreadPoolExecutor so every COM call runs on the
+# same thread, and initialise COM once on that thread at startup.
+# ---------------------------------------------------------------------------
+_com_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="outlook-com")
+
+
+def _init_com_thread():
+    """Called once on the dedicated thread to set up the COM apartment."""
+    pythoncom.CoInitialize()
+
+
+# Block until COM is initialised on the worker thread
+_com_executor.submit(_init_com_thread).result()
+
+
+def _shutdown_com():
+    """Clean up the COM thread on interpreter exit."""
+    try:
+        _com_executor.submit(pythoncom.CoUninitialize).result(timeout=5)
+    except Exception:
+        pass
+    _com_executor.shutdown(wait=False)
+
+
+atexit.register(_shutdown_com)
+
+
+async def _run_com(func, *args, **kwargs):
+    """Run *func* on the dedicated COM thread (non-blocking to the event loop)."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _com_executor, lambda: func(*args, **kwargs)
+    )
 
 # Create MCP server
 app = Server("outlook-mcp-server")
@@ -54,13 +99,13 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_email_chain",
-            description="Searches for emails containing the specified text in BOTH subject and body using exact phrase matching. Retrieves complete email chains with full email bodies for comprehensive analysis. Searches ALL folders in both personal and shared mailboxes. Returns full email content including sender, recipients, timestamps, and complete message bodies. Use specific search terms (error codes, alert identifiers, unique phrases) for best results.",
+            description="Searches for emails containing the specified text in BOTH subject and body. Searches Inbox, all Inbox subfolders, and Sent Items. Returns full email content including sender, To/CC recipients with email addresses, timestamps, and message bodies.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "search_text": {
                         "type": "string",
-                        "description": "Exact text pattern to search for in email subject and body. The search looks for this exact phrase."
+                        "description": "Text to search for in email subject and body (case-insensitive substring match)."
                     },
                     "include_personal": {
                         "type": "boolean",
@@ -68,7 +113,31 @@ async def list_tools() -> list[types.Tool]:
                         "default": True
                     },
                     "include_shared": {
-                        "type": "boolean", 
+                        "type": "boolean",
+                        "description": "Search shared mailbox (default: true)",
+                        "default": True
+                    }
+                },
+                "required": ["search_text"]
+            }
+        ),
+        types.Tool(
+            name="get_email_contacts",
+            description="Contact intelligence tool. Searches emails by keyword, then returns a ranked list of every person on those threads — with name, SMTP email, and how many times they appeared as sender, To, or CC. Use this to map who is involved in order threads, vendor conversations, or project discussions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "search_text": {
+                        "type": "string",
+                        "description": "Keyword to search for (e.g. a vendor name, order number, project)."
+                    },
+                    "include_personal": {
+                        "type": "boolean",
+                        "description": "Search personal mailbox (default: true)",
+                        "default": True
+                    },
+                    "include_shared": {
+                        "type": "boolean",
                         "description": "Search shared mailbox (default: true)",
                         "default": True
                     }
@@ -93,12 +162,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[types.Text
             search_text = arguments.get("search_text")
             if not search_text:
                 raise ValueError("search_text parameter is required")
-            
+
             include_personal = arguments.get("include_personal", True)
             include_shared = arguments.get("include_shared", True)
-            
+
             return await handle_get_email_chain(search_text, include_personal, include_shared)
-            
+
+        elif name == "get_email_contacts":
+            search_text = arguments.get("search_text")
+            if not search_text:
+                raise ValueError("search_text parameter is required")
+
+            include_personal = arguments.get("include_personal", True)
+            include_shared = arguments.get("include_shared", True)
+
+            return await handle_get_email_contacts(search_text, include_personal, include_shared)
+
         else:
             raise ValueError(f"Unknown tool: {name}")
             
@@ -118,8 +197,8 @@ async def handle_check_mailbox_access():
     logger.info("Checking mailbox access...")
     
     try:
-        # Check access to mailboxes (non-blocking)
-        access_result = await asyncio.to_thread(outlook_client.check_access)
+        # Check access to mailboxes (runs on dedicated COM thread)
+        access_result = await _run_com(outlook_client.check_access)
         
         # Format response
         formatted_result = format_mailbox_status(access_result)
@@ -146,11 +225,11 @@ async def handle_get_email_chain(search_text: str, include_personal: bool, inclu
     logger.info(f"Searching for emails containing: {search_text}")
     
     try:
-        # Search for emails in both subject and body (non-blocking)
-        emails = await asyncio.to_thread(
+        # Search for emails in both subject and body (runs on dedicated COM thread)
+        emails = await _run_com(
             outlook_client.search_emails,
             search_text=search_text,
-            include_personal=include_personal, 
+            include_personal=include_personal,
             include_shared=include_shared
         )
         
@@ -173,6 +252,42 @@ async def handle_get_email_chain(search_text: str, include_personal: bool, inclu
             ]
         }
         return [types.TextContent(type="text", text=str(error_response))]
+
+
+async def handle_get_email_contacts(search_text: str, include_personal: bool, include_shared: bool):
+    """Search emails, then return a ranked contact/participant list."""
+    logger.info(f"Contact intelligence search for: {search_text}")
+
+    try:
+        emails = await _run_com(
+            outlook_client.search_emails,
+            search_text=search_text,
+            include_personal=include_personal,
+            include_shared=include_shared
+        )
+
+        # Build the participant list via the formatter helper
+        from src.utils.email_formatter import get_participants, get_date_range
+        participants = get_participants(emails)
+
+        result = {
+            "status": "success" if emails else "no_emails_found",
+            "search_text": search_text,
+            "emails_scanned": len(emails),
+            "date_range": get_date_range(emails),
+            "contacts": participants,
+        }
+
+        logger.info(f"Found {len(participants)} unique contacts across {len(emails)} emails")
+        return [types.TextContent(type="text", text=str(result))]
+
+    except Exception as e:
+        logger.error(f"Error in contact search: {e}")
+        return [types.TextContent(type="text", text=str({
+            "status": "error",
+            "search_text": search_text,
+            "message": f"Contact search failed: {e}"
+        }))]
 
 
 @app.list_resources()
@@ -222,6 +337,7 @@ async def main():
     print("\n[TOOLS] Available Tools:")
     print("   1. check_mailbox_access - Test connection and access")
     print("   2. get_email_chain - Search emails by text in subject AND body")
+    print("   3. get_email_contacts - Contact intelligence (who is on which threads)")
     
     print(f"\n[READY] Server ready! Listening for MCP client connections...")
     print("=" * 60)
