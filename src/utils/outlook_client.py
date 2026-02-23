@@ -4,8 +4,10 @@ import win32com.client
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 import logging
+import os
 import pythoncom
 import re
+import subprocess
 import time
 import threading
 from functools import lru_cache
@@ -23,6 +25,9 @@ OL_BCC = 3
 
 # MAPI property tag for SMTP address (resolves Exchange DNs to real emails)
 PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+
+# Classic Outlook executable path.  New Outlook (AppX) does NOT support COM.
+_CLASSIC_OUTLOOK_EXE = r"C:\Program Files\Microsoft Office\Root\Office16\OUTLOOK.EXE"
 
 
 class OutlookClient:
@@ -49,14 +54,38 @@ class OutlookClient:
             logger.info("Connecting to Outlook...")
             start_time = time.time()
 
-            # Try to connect to existing Outlook instance first (much faster)
+            # Try to connect to an existing *Classic* Outlook instance.
+            # New Outlook (AppX) does NOT support COM — only Classic works.
             try:
                 self.outlook = win32com.client.GetActiveObject("Outlook.Application")
-                logger.info("Connected to existing Outlook instance")
+                logger.info("Connected to existing Classic Outlook instance")
             except Exception as e:
-                # GetActiveObject fails if no running instance; fall back to Dispatch
-                logger.info(f"No active Outlook instance ({type(e).__name__}), creating via Dispatch...")
-                self.outlook = win32com.client.Dispatch("Outlook.Application")
+                # No COM-visible Outlook running.  Launch Classic Outlook
+                # explicitly so we don't accidentally start New Outlook.
+                if os.path.isfile(_CLASSIC_OUTLOOK_EXE):
+                    logger.info("Launching Classic Outlook...")
+                    subprocess.Popen([_CLASSIC_OUTLOOK_EXE])
+                    # Wait for Outlook to register in the ROT
+                    for attempt in range(15):
+                        time.sleep(2)
+                        try:
+                            self.outlook = win32com.client.GetActiveObject("Outlook.Application")
+                            logger.info("Connected after launching Classic Outlook")
+                            break
+                        except Exception:
+                            pass
+                    else:
+                        raise RuntimeError(
+                            "Classic Outlook was launched but did not register "
+                            "for COM.  Make sure New Outlook is not intercepting "
+                            "the launch (disable the 'New Outlook' toggle)."
+                        )
+                else:
+                    logger.warning(
+                        f"Classic Outlook not found at {_CLASSIC_OUTLOOK_EXE}, "
+                        "falling back to Dispatch (may start New Outlook)"
+                    )
+                    self.outlook = win32com.client.Dispatch("Outlook.Application")
 
             self.namespace = self.outlook.GetNamespace("MAPI")
 

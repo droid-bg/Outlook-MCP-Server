@@ -8,15 +8,21 @@ echo  Outlook MCP Server - Uninstall
 echo ============================================================
 echo.
 
-:: Stop the task if running
+:: Stop and remove MCP server task
 schtasks /end /tn "OutlookMCPServer" >nul 2>&1
-
-:: Delete the task
 schtasks /delete /tn "OutlookMCPServer" /f >nul 2>&1
 if %errorlevel% equ 0 (
-    echo [OK] Scheduled task 'OutlookMCPServer' removed.
+    echo [OK] OutlookMCPServer task removed.
 ) else (
-    echo [INFO] No scheduled task found (already removed or never installed).
+    echo [INFO] OutlookMCPServer task not found.
+)
+
+:: Remove Classic Outlook auto-start task
+schtasks /delete /tn "ClassicOutlookAutoStart" /f >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [OK] ClassicOutlookAutoStart task removed.
+) else (
+    echo [INFO] ClassicOutlookAutoStart task not found.
 )
 
 echo.
