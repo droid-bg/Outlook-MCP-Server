@@ -61,3 +61,7 @@ Thumbs.db
 # Project specific
 *.log
 config.properties.backup
+
+# Claude Code
+.claude/
+.live_test.py
