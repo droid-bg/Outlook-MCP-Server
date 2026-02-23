@@ -65,3 +65,4 @@ config.properties.backup
 # Claude Code
 .claude/
 .live_test.py
+.shared_test.py
